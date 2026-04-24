@@ -7,9 +7,6 @@ from math import radians, sin, cos, sqrt, atan2
 import pydeck as pdk
 import matplotlib.cm as cm
 
-# -----------------------------
-# CONFIG
-# -----------------------------
 st.set_page_config(layout="wide")
 st.title("Delivery Optimization Dashboard")
 
@@ -24,7 +21,7 @@ df["timestamp"] = pd.to_datetime(df["timestamp"])
 # -----------------------------
 st.sidebar.header("⏱ Controls")
 
-window = st.sidebar.slider("Window (min)", 3, 10, 6)
+window = st.sidebar.slider("Window (min)", 3, 10, 5)
 
 start_time = st.sidebar.slider(
     "Start Time",
@@ -60,14 +57,11 @@ target_ratio = st.sidebar.slider("Supply Ratio", 0.5, 1.5, 0.7)
 riders_available = int(0.5 * base_riders + 0.5 * (target_ratio * orders)) if orders > 0 else int(base_riders)
 
 # -----------------------------
-# STORE LOCATION
+# STORE
 # -----------------------------
 STORE_LAT = 29.8543
 STORE_LON = 77.8880
 
-# -----------------------------
-# DISTANCE FUNCTION
-# -----------------------------
 def haversine(lat1, lon1, lat2, lon2):
     R = 6371
     dlat = radians(lat2 - lat1)
@@ -86,17 +80,23 @@ if orders > 0:
 batch_df = batch_df.dropna()
 
 # -----------------------------
-# BATCHING PARAMETERS
+# PARAMETERS
 # -----------------------------
 T_pickup = 2
 T_drop = 2
 speed = 20
 
+# -----------------------------
+# UPDATED BATCHING FUNCTION
+# -----------------------------
 def create_batches(cluster_df, sla):
     cluster_df = cluster_df.copy()
+
     cluster_df["dist"] = cluster_df.apply(
-        lambda row: haversine(STORE_LAT, STORE_LON, row["latitude"], row["longitude"]), axis=1
+        lambda row: haversine(STORE_LAT, STORE_LON, row["latitude"], row["longitude"]),
+        axis=1
     )
+
     cluster_df = cluster_df.sort_values("dist")
 
     batches = []
@@ -104,24 +104,31 @@ def create_batches(cluster_df, sla):
 
     while i < len(cluster_df):
         k = 0
-        while i+k < len(cluster_df):
-            subset = cluster_df.iloc[i:i+k+1]
-            avg_dist = subset["dist"].mean()
-            t = T_pickup + (avg_dist/speed)*60 + (k+1)*T_drop
 
-            if t <= sla:
+        while i + k < len(cluster_df):
+            subset = cluster_df.iloc[i:i+k+1]
+
+            avg_dist = subset["dist"].mean()
+            travel_time = (avg_dist / speed) * 60
+            delivery_time = T_pickup + travel_time + (k+1)*T_drop
+
+            # 🔥 ADD WAITING TIME HERE
+            total_time = window + delivery_time
+
+            if total_time <= sla:
                 k += 1
             else:
                 break
 
         batch = cluster_df.iloc[i:i+max(1,k)]
         batches.append(batch)
+
         i += max(1,k)
 
     return batches
 
 # -----------------------------
-# SLA BASE
+# SLA BASE (UPDATED)
 # -----------------------------
 sla_batches = []
 for cid in batch_df["cluster"].unique():
@@ -131,21 +138,21 @@ for cid in batch_df["cluster"].unique():
         for idx in cluster_df.index:
             sla_batches.append(cluster_df.loc[[idx]])
     else:
-        sla_batches.extend(create_batches(cluster_df, 10))
+        sla_batches.extend(create_batches(cluster_df, 12))  # FIXED
 
 sla_riders = len(sla_batches)
 
 # -----------------------------
-# RELAXED SLA
+# RELAXED SLA (UPDATED)
 # -----------------------------
 pressure = sla_riders / riders_available if riders_available > 0 else 10
 
 if pressure < 0.8:
-    strategy, sla = "Strict", 10
+    strategy, sla = "Strict", 12
 elif pressure < 1.2:
-    strategy, sla = "Balanced", 11
+    strategy, sla = "Balanced", 13
 else:
-    strategy, sla = "Aggressive", 12
+    strategy, sla = "Aggressive", 15
 
 relaxed_batches = []
 for cid in batch_df["cluster"].unique():
@@ -160,20 +167,6 @@ for cid in batch_df["cluster"].unique():
 relaxed_riders = len(relaxed_batches)
 
 # -----------------------------
-# ASSIGN BATCH COLORS (FIX)
-# -----------------------------
-batch_df["batch_id"] = -1
-
-for i, batch in enumerate(relaxed_batches):
-    batch_df.loc[batch.index, "batch_id"] = i
-
-cmap = cm.get_cmap('tab20', len(relaxed_batches))
-
-batch_df["r"] = batch_df["batch_id"].apply(lambda x: int(cmap(x % 20)[0]*255))
-batch_df["g"] = batch_df["batch_id"].apply(lambda x: int(cmap(x % 20)[1]*255))
-batch_df["b"] = batch_df["batch_id"].apply(lambda x: int(cmap(x % 20)[2]*255))
-
-# -----------------------------
 # KPI
 # -----------------------------
 c1,c2,c3,c4 = st.columns(4)
@@ -184,7 +177,21 @@ c3.metric("SLA Riders", sla_riders)
 c4.metric("Relaxed SLA Riders", relaxed_riders)
 
 # -----------------------------
-# MAP (FINAL FIXED)
+# ASSIGN COLORS TO BATCHES
+# -----------------------------
+batch_df["batch_id"] = -1
+
+for i, batch in enumerate(relaxed_batches):
+    batch_df.loc[batch.index, "batch_id"] = i
+
+cmap = cm.get_cmap('tab20', max(1, len(relaxed_batches)))
+
+batch_df["r"] = batch_df["batch_id"].apply(lambda x: int(cmap(x % 20)[0]*255))
+batch_df["g"] = batch_df["batch_id"].apply(lambda x: int(cmap(x % 20)[1]*255))
+batch_df["b"] = batch_df["batch_id"].apply(lambda x: int(cmap(x % 20)[2]*255))
+
+# -----------------------------
+# MAP
 # -----------------------------
 st.subheader("Rider Routes")
 
@@ -193,9 +200,10 @@ orders_layer = pdk.Layer(
     data=batch_df,
     get_position='[longitude, latitude]',
     get_color='[r, g, b]',
-    get_radius=60,
+    get_radius=50,
 )
 
+# ROUTES (multi-stop paths)
 route_paths = []
 for i, batch in enumerate(relaxed_batches):
     path = [[STORE_LON, STORE_LAT]]
@@ -217,23 +225,25 @@ routes = pdk.Layer(
     width_scale=3,
 )
 
+# STORE (smaller size)
 store_layer = pdk.Layer(
     "ScatterplotLayer",
     data=pd.DataFrame({"lat":[STORE_LAT],"lon":[STORE_LON]}),
     get_position='[lon,lat]',
-    get_color='[255,255,0]',
-    get_radius=100,
+    get_color='[255, 215, 0]',  # gold/yellow
+    get_radius=60,
 )
 
+# DISPLAY MAP
 st.pydeck_chart(pdk.Deck(
     layers=[routes, orders_layer, store_layer],
     initial_view_state=pdk.ViewState(
-        latitude=batch_df["latitude"].mean() if orders>0 else STORE_LAT,
-        longitude=batch_df["longitude"].mean() if orders>0 else STORE_LON,
-        zoom=13
+        latitude=batch_df["latitude"].mean() if len(batch_df)>0 else STORE_LAT,
+        longitude=batch_df["longitude"].mean() if len(batch_df)>0 else STORE_LON,
+        zoom=13,
+        pitch=0,
     )
 ))
-
 # -----------------------------
 # STATUS
 # -----------------------------
@@ -248,24 +258,28 @@ else:
     st.success("System Balanced")
 
 # -----------------------------
-# CLEAN GRAPH
+# GRAPH
 # -----------------------------
 st.subheader("Comparison")
 
-fig, ax = plt.subplots(figsize=(6,3))
+fig, ax = plt.subplots(figsize=(3.5, 1.8))
 
 labels = ["Available","SLA","Relaxed"]
 values = [riders_available, sla_riders, relaxed_riders]
 
-bars = ax.bar(labels, values)
+bars = ax.bar(labels, values, width=0.4)
 
 for bar in bars:
     ax.text(bar.get_x()+bar.get_width()/2,
             bar.get_height(),
             int(bar.get_height()),
-            ha='center')
+            ha='center',
+            fontsize=8)
 
 ax.spines['top'].set_visible(False)
 ax.spines['right'].set_visible(False)
+ax.spines['left'].set_visible(False)
+ax.set_yticks([])
 
+plt.tight_layout()
 st.pyplot(fig)
